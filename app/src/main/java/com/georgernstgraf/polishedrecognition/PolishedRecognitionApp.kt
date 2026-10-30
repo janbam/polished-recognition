@@ -6,6 +6,7 @@ import android.os.Process
 import android.util.Log
 import com.georgernstgraf.polishedrecognition.api.OpenAiChatApiService
 import com.georgernstgraf.polishedrecognition.api.OpenAiSttApiService
+import com.georgernstgraf.polishedrecognition.api.OpenCodeGoInterceptor
 import com.georgernstgraf.polishedrecognition.config.ProviderPresetLoader
 import com.georgernstgraf.polishedrecognition.config.SettingsStore
 import com.georgernstgraf.polishedrecognition.config.SttFragmentSizer
@@ -219,6 +220,13 @@ class PolishedRecognitionApp : Application() {
     private val sttApiCache = ConcurrentHashMap<String, OpenAiSttApiService>()
     private val chatApiCache = ConcurrentHashMap<String, OpenAiChatApiService>()
 
+    /** LLM-only wire policy, before response logging; the shared STT client remains unchanged. */
+    private val chatHttpClient by lazy {
+        okHttpClient.newBuilder().apply {
+            interceptors().add(0, OpenCodeGoInterceptor("PolishedRecognition/${BuildConfig.VERSION_NAME}"))
+        }.build()
+    }
+
     fun getSttApi(baseUrl: String): OpenAiSttApiService =
         sttApiCache.getOrPut(baseUrl) {
             Retrofit.Builder()
@@ -233,7 +241,7 @@ class PolishedRecognitionApp : Application() {
         chatApiCache.getOrPut(baseUrl) {
             Retrofit.Builder()
                 .baseUrl(baseUrl)
-                .client(okHttpClient)
+                .client(chatHttpClient)
                 .addConverterFactory(GsonConverterFactory.create())
                 .build()
                 .create(OpenAiChatApiService::class.java)

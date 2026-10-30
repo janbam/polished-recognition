@@ -5,6 +5,7 @@ import android.widget.EditText
 import com.georgernstgraf.polishedrecognition.PolishedRecognitionApp
 import com.georgernstgraf.polishedrecognition.R
 import com.georgernstgraf.polishedrecognition.config.SettingsStore
+import com.georgernstgraf.polishedrecognition.api.dto.ModelEntry
 import com.google.common.truth.Truth.assertThat
 import org.junit.After
 import org.junit.Before
@@ -97,6 +98,16 @@ class SettingsActivityTest {
         assertThat(activity.textField(errorField).error).isNotNull()
         // A save abort never DELETES a stored provider config (#150).
         assertThat(prefs().getString("stt_provider", null)).isNotNull()
+    }
+
+    @Test
+    fun transcriptionModelList_keepsGptTranscribeAlongsideWhisper() {
+        assertThat(SettingsActivity.sttModelIds(listOf(
+            ModelEntry("whisper-1"), ModelEntry("gpt-transcribe"),
+            ModelEntry("gpt-live-transcribe"), ModelEntry("gpt-6-luna")
+        ))).containsExactly("whisper-1", "gpt-transcribe", "gpt-live-transcribe").inOrder()
+        assertThat(SettingsActivity.sttModelIds(listOf(ModelEntry("custom-model"))))
+            .containsExactly("custom-model")
     }
 
     @Test

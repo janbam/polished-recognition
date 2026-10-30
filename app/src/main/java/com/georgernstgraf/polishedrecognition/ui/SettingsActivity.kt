@@ -36,6 +36,7 @@ import com.georgernstgraf.polishedrecognition.config.LlmProviderConfig
 import com.georgernstgraf.polishedrecognition.config.SttProviderConfig
 import com.georgernstgraf.polishedrecognition.api.dto.ChatMessage
 import com.georgernstgraf.polishedrecognition.api.dto.ChatRequest
+import com.georgernstgraf.polishedrecognition.api.dto.ModelEntry
 import com.georgernstgraf.polishedrecognition.pipeline.PromptStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -657,11 +658,7 @@ class SettingsActivity : Activity() {
                 val api = app.getSttApi(baseUrl)
                 val response = api.listModelsSync("Bearer $token").execute()
                 if (response.isSuccessful && response.body() != null) {
-                    val audioModels = response.body()!!.data
-                        .filter { it.id.contains("whisper", ignoreCase = true) || it.id.contains("asr", ignoreCase = true) }
-                        .map { it.id }
-                    val allModels = response.body()!!.data.map { it.id }
-                    Result.success(if (audioModels.isNotEmpty()) audioModels else allModels)
+                    Result.success(sttModelIds(response.body()!!.data))
                 } else {
                     val detail = extractErrorDetail(response.errorBody())
                     val msg = if (detail.isNotEmpty()) "HTTP ${response.code()}: $detail" else "HTTP ${response.code()}"
@@ -1102,5 +1099,14 @@ class SettingsActivity : Activity() {
 
     companion object {
         private const val TAG = "SettingsActivity"
+
+        /** Includes GPT transcription models beside Whisper/ASR, retaining the custom-provider fallback. */
+        internal fun sttModelIds(models: List<ModelEntry>): List<String> {
+            val ids = models.map { it.id }
+            // Prefer known transcription families without hiding newer GPT transcribe models.
+            return ids.filter { id ->
+                listOf("whisper", "asr", "transcribe").any { id.contains(it, ignoreCase = true) }
+            }.ifEmpty { ids }
+        }
     }
 }
