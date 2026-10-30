@@ -9,6 +9,9 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import okhttp3.ResponseBody
+import okhttp3.RequestBody
+import okhttp3.ResponseBody.Companion.toResponseBody
+import com.google.gson.Gson
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -71,6 +74,28 @@ class SttRequestRunnerTest {
     private fun httpError(code: Int) =
         @Suppress("DEPRECATION")
         Response.error<SttResponse>(code, ResponseBody.create(null, "error"))
+
+    /** Captures actual multipart format values while supplying observed API responses. */
+    private fun formatsFor(vararg responses: Response<SttResponse>): List<RequestBody> {
+        val formats = mutableListOf<RequestBody>()
+        val call = mockk<Call<SttResponse>>()
+        every { call.execute() } returnsMany responses.toList()
+        every { sttApi.transcribeAudioSync(any(), any(), any(), capture(formats), any()) } returns call
+        return formats
+    }
+
+    /** Error wording captured from OpenAI's rejection of gpt-transcribe verbose JSON. */
+    private fun formatRejection(): Response<SttResponse> = Response.error(
+        400,
+        """{"error":{"message":"response_format 'verbose_json' is not compatible with model 'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.","type":"invalid_request_error","param":"response_format"}}""".toResponseBody()
+    )
+
+    /** Decodes captured text multipart parts, not their object identities. */
+    private fun List<RequestBody>.texts(): List<String> = map { body ->
+        val buffer = okio.Buffer()
+        body.writeTo(buffer)
+        buffer.readUtf8()
+    }
 
     /** 16-bit mono @ 16 kHz: 16000 data bytes = 500 ms (WavWriter layout). */
     private fun wavFile(name: String = "fragment.wav"): File =
@@ -156,6 +181,93 @@ class SttRequestRunnerTest {
         assertThat((result.exceptionOrNull() as SttRequestRunner.SttRequestException).httpCode).isEqualTo(400)
         assertThat(delays).isEmpty()
         assertThat((readLog("stt-latency")["attempt"] as Double).toInt()).isEqualTo(1)
+    }
+
+    @Test
+    fun `format rejection retries JSON immediately and remembers capability for later fragments`() = kotlinx.coroutines.runBlocking {
+        val formats = formatsFor(formatRejection(), success(), success())
+        val runner = runner()
+        val wav = wavFile()
+
+        assertThat(runner.run(wav, config).isSuccess).isTrue()
+        assertThat(formats.texts()).containsExactly("verbose_json", "json").inOrder()
+        assertThat(readLog("stt-latency")["attempt"]).isEqualTo(2.0)
+        assertThat(readLog("stt-latency_1")["httpCode"]).isEqualTo(400.0)
+        assertThat(runner.run(wav, config).isSuccess).isTrue()
+        assertThat(formats.texts()).containsExactly("verbose_json", "json", "json").inOrder()
+        assertThat(delays).isEmpty()
+    }
+
+    @Test
+    fun `JSON capability is isolated by endpoint and model but not token`() = kotlinx.coroutines.runBlocking {
+        val formats = formatsFor(formatRejection(), success(), success(), success(), success())
+        val runner = runner()
+        val wav = wavFile()
+
+        assertThat(runner.run(wav, config).isSuccess).isTrue()
+        assertThat(runner.run(wav, config.copy(apiToken = "new-token")).isSuccess).isTrue()
+        assertThat(runner.run(wav, config.copy(model = "another-model")).isSuccess).isTrue()
+        assertThat(runner.run(wav, config.copy(baseUrl = "https://api.openai.com/v1/")).isSuccess).isTrue()
+        assertThat(formats.texts()).containsExactly("verbose_json", "json", "json", "verbose_json", "verbose_json").inOrder()
+    }
+
+    @Test
+    fun `format negotiation preserves the full transient retry budget and JSON choice`() = kotlinx.coroutines.runBlocking {
+        val formats = formatsFor(httpError(500), formatRejection(), httpError(429), success())
+
+        assertThat(runner().run(wavFile(), config).isSuccess).isTrue()
+        assertThat(formats.texts()).containsExactly("verbose_json", "verbose_json", "json", "json").inOrder()
+        assertThat(delays).containsExactly(1L, 2L).inOrder()
+        assertThat(readLog("stt-latency")["attempt"]).isEqualTo(4.0)
+    }
+
+    @Test
+    fun `JSON rejection fails without another format retry`() = kotlinx.coroutines.runBlocking {
+        val formats = formatsFor(formatRejection(), formatRejection())
+
+        val result = runner().run(wavFile(), config)
+
+        assertThat((result.exceptionOrNull() as SttRequestRunner.SttRequestException).httpCode).isEqualTo(400)
+        assertThat(formats.texts()).containsExactly("verbose_json", "json").inOrder()
+        assertThat(delays).isEmpty()
+    }
+
+    @Test
+    fun `unrelated validation errors and echoed format text do not trigger negotiation or cache changes`() = kotlinx.coroutines.runBlocking {
+        val unrelated = Response.error<SttResponse>(400,
+            """{"error":{"message":"Invalid prompt","param":"prompt"},"input":"response_format"}""".toResponseBody())
+        val formats = formatsFor(unrelated, success())
+        val runner = runner()
+        val wav = wavFile()
+
+        assertThat(runner.run(wav, config, prompt = "context").isFailure).isTrue()
+        assertThat(runner.run(wav, config).isSuccess).isTrue()
+        assertThat(formats.texts()).containsExactly("verbose_json", "verbose_json").inOrder()
+        assertThat(delays).isEmpty()
+    }
+
+    @Test
+    fun `OpenAI JSON language codes normalize to the language contract consumed by both pipelines`() = kotlinx.coroutines.runBlocking {
+        // Shape observed from a successful gpt-transcribe JSON response.
+        val body = Gson().fromJson("""{"text":"Hallo Welt","languages":[{"code":"de"}],"usage":{"type":"duration","seconds":1}}""", SttResponse::class.java)
+        mockStt(Response.success(body))
+
+        val response = runner().run(wavFile(), config).getOrThrow()
+
+        assertThat(response.text).isEqualTo("Hallo Welt")
+        assertThat(response.language).isEqualTo("de")
+        assertThat(response.languageProbability).isNull()
+    }
+
+    @Test
+    fun `singular language and probability remain authoritative when both language forms appear`() = kotlinx.coroutines.runBlocking {
+        val body = Gson().fromJson("""{"text":"Hallo","language":"German","language_probability":0.9,"languages":[{"code":"en"}]}""", SttResponse::class.java)
+        mockStt(Response.success(body))
+
+        val response = runner().run(wavFile(), config).getOrThrow()
+
+        assertThat(response.language).isEqualTo("German")
+        assertThat(response.languageProbability).isEqualTo(0.9f)
     }
 
     @Test

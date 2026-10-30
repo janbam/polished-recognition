@@ -2,10 +2,17 @@ package com.georgernstgraf.polishedrecognition.api.dto
 
 import com.google.gson.annotations.SerializedName
 
+/** Transcription payload; the runner normalizes provider language variants before delivery. */
 data class SttResponse(
     @SerializedName("text") val text: String,
     @SerializedName("language") val language: String? = null,
-    @SerializedName("language_probability") val languageProbability: Float? = null
+    @SerializedName("language_probability") val languageProbability: Float? = null,
+    @SerializedName("languages") val languages: List<SttLanguage>? = null
+)
+
+/** Language entry reported by OpenAI's JSON transcription format. */
+data class SttLanguage(
+    @SerializedName("code") val code: String? = null
 )
 
 data class ChatResponse(

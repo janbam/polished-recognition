@@ -5,19 +5,23 @@ import com.georgernstgraf.polishedrecognition.api.dto.SttResponse
 import com.georgernstgraf.polishedrecognition.audio.AudioDuration
 import com.georgernstgraf.polishedrecognition.config.SttProviderConfig
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
 import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Runs ONE STT request for one audio file with the #116 retry policy: up to
  * [MAX_ATTEMPTS] attempts, retrying only transient failures (IOException /
  * timeouts, HTTP 5xx, HTTP 429) with a 1 s / 2 s backoff; auth/validation
- * 4xx and empty 2xx bodies fail immediately.
+ * 4xx and empty 2xx bodies fail immediately, except an explicit rejection of
+ * `response_format`: verbose JSON is negotiated down to JSON once per endpoint/model.
  *
  * Writes two evidence streams:
  * - `stt-upload.json` (unchanged #115 semantics): pre-send proof that the
@@ -49,6 +53,9 @@ class SttRequestRunner(
     private val onCompletion: ((Completion) -> Unit)? = null
 ) {
 
+    /** Process-local capabilities, scoped by canonical endpoint and exact model, never credentials. */
+    private val jsonOnly = ConcurrentHashMap.newKeySet<Pair<String, String>>()
+
     /** Successful request measurement (#116 Phase 2 profile sample). */
     data class Completion(
         val config: SttProviderConfig,
@@ -64,7 +71,8 @@ class SttRequestRunner(
     /**
      * Executes one upload. Fails fast on non-transient errors; otherwise
      * retries up to [MAX_ATTEMPTS] total attempts with the configured
-     * backoff between attempts.
+     * backoff between attempts. Format negotiation adds at most one immediate
+     * wire attempt; transient retries retain the negotiated format.
      *
      * [prompt] (#117): optional Whisper conditioning prompt — the tail of
      * the previous fragment's transcript. Conditioned text is NOT echoed
@@ -80,6 +88,8 @@ class SttRequestRunner(
         val mediaType = if (isOgg(audioFile)) "audio/ogg" else "audio/wav"
         val uploadName = if (isOgg(audioFile)) "audio.ogg" else "audio.wav"
         val durationMs = AudioDuration.estimateMs(audioFile)
+        val providerKey = config.baseUrl.toHttpUrl().toString() to config.model
+        var responseFormat = if (providerKey in jsonOnly) "json" else "verbose_json"
 
         // Pre-send evidence (#115 semantics, unchanged shape).
         logger?.log(
@@ -96,8 +106,10 @@ class SttRequestRunner(
         )
 
         var lastFailure: SttRequestException? = null
-        repeat(MAX_ATTEMPTS) { zeroBased ->
-            val attempt = zeroBased + 1
+        var transientAttempts = 0
+        var attempt = 0
+        while (transientAttempts < MAX_ATTEMPTS) {
+            attempt++
             val startedAt = System.nanoTime()
             try {
                 val response = getSttApi(config.baseUrl).transcribeAudioSync(
@@ -106,7 +118,7 @@ class SttRequestRunner(
                         "file", uploadName, audioFile.asRequestBody(mediaType.toMediaTypeOrNull())
                     ),
                     model = config.model.toRequestBody("text/plain".toMediaTypeOrNull()),
-                    responseFormat = "verbose_json".toRequestBody("text/plain".toMediaTypeOrNull()),
+                    responseFormat = responseFormat.toRequestBody("text/plain".toMediaTypeOrNull()),
                     prompt = prompt?.toRequestBody("text/plain".toMediaTypeOrNull())
                 ).execute()
                 val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
@@ -116,11 +128,24 @@ class SttRequestRunner(
                     if (durationMs != null) {
                         onCompletion?.invoke(Completion(config, mediaType, durationMs, elapsedMs, attempt))
                     }
-                    return Result.success(response.body()!!)
+                    // Keep one language contract for live fragments and ordinary chunks.
+                    val body = response.body()!!
+                    return Result.success(body.copy(
+                        language = body.language?.takeIf { it.isNotBlank() }
+                            ?: body.languages?.firstOrNull { !it.code.isNullOrBlank() }?.code
+                    ))
                 }
                 val code = response.code()
                 val errorKind = if (response.isSuccessful) "emptyBody" else null
                 logCompletion(audioFile, config, mediaType, durationMs, attempt, code, elapsedMs, errorKind, prompt)
+                // Negotiate only the rejected field; unrelated 400s must reach the prompt fallback.
+                if (code == 400 && responseFormat == "verbose_json" &&
+                    rejectsResponseFormat(response.errorBody()?.use { it.string() })
+                ) {
+                    jsonOnly.add(providerKey)
+                    responseFormat = "json"
+                    continue
+                }
                 val failure = if (response.isSuccessful) {
                     SttRequestException("HTTP $code (empty response body)", httpCode = code)
                 } else {
@@ -133,12 +158,24 @@ class SttRequestRunner(
                 logCompletion(audioFile, config, mediaType, durationMs, attempt, null, elapsedMs, e.javaClass.simpleName, prompt)
                 lastFailure = SttRequestException(e.message ?: e.javaClass.simpleName)
             }
-            if (attempt < MAX_ATTEMPTS) sleep(backoffMs[zeroBased])
+            // Capability negotiation does not spend the transient-error retry budget.
+            transientAttempts++
+            if (transientAttempts < MAX_ATTEMPTS) sleep(backoffMs[transientAttempts - 1])
         }
         return Result.failure(lastFailure ?: SttRequestException("unknown STT failure"))
     }
 
     private fun isTransientHttp(code: Int): Boolean = code in 500..599 || code == 429
+
+    /** Recognizes a structured API error about response_format, not arbitrary echoed input. */
+    private fun rejectsResponseFormat(body: String?): Boolean = try {
+        val error = GsonBuilder().create().fromJson(body, JsonObject::class.java)
+            ?.getAsJsonObject("error")
+        error?.get("param")?.takeUnless { it.isJsonNull }?.asString == "response_format" ||
+            error?.get("message")?.asString?.contains("response_format", ignoreCase = true) == true
+    } catch (_: Exception) {
+        false
+    }
 
     private fun logCompletion(
         audioFile: File,

@@ -3,6 +3,12 @@
 Architectural and technical decisions made in this project.
 Each entry documents WHAT was decided and WHY.
 
+## 2026-10-30: JSON-only STT negotiation and OpenCode Go wire policy, Jan's fork #1 and #2
+
+- Keep `verbose_json` for compatible providers. Only a structured HTTP 400 naming `response_format` permits an immediate JSON retry; cache that capability in the runner by canonical endpoint and exact model. Negotiation does not consume the transient retry budget, and later retries retain JSON. Normalize `languages[].code` into the existing singular language contract at the successful request boundary, preserving existing language and probability when supplied.
+- Keep the LLM on Chat Completions. Go's preset base is `https://opencode.ai/inference/go/openai/v1/`, with `gpt-6-luna` as default. Its catalog is `/inference/go/v1/models`, outside the OpenAI adapter. An interceptor on the derived LLM client owns that route and the `User-Agent` plus `x-opencode-session` headers, matched by exact HTTPS host, port, path, and method. No generic stored-header schema is needed. A dictation currently makes one LLM call, so one UUID per call is one conversation and survives OkHttp transport retries. Multi-call conversations would require explicit session ownership instead.
+- Jan explicitly chose Go after reviewing its documented coding-agent traffic guidance. Identify the app honestly, never as another client. Primary contracts: https://opencode.ai/v2/docs/console/go/ and https://opencode.ai/v2/docs/console/harnesses/.
+
 ## 2026-10-19: #151 release 1.5.1 — patch bump carrying #148 + the save-path robustness fix; #150 NOT shipped
 - **Scope decision (owner):** 1.5.1 = #148 (STT timing reaches devices, HANDOFF-announced as "next release build") + the save-path robustness fix; everything else since v1.5.0 rides along unchanged (:analyzer CLI, harness removal, :core extraction). A PATCH, not a minor bump — no user-visible feature was added on the app side.
 - **#150 is NOT a blocker for the release** (owner's instruction when choosing "triage #150 first"): triaged, not reproducible on OxygenOS, left OPEN pending the reporter.
